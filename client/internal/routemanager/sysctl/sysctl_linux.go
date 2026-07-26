@@ -68,9 +68,28 @@ func Setup(wgIface iface) (map[string]int, error) {
 	return keys, nberrors.FormatErrorOrNil(result)
 }
 
+// procSysPath converts a sysctl key to its /proc/sys file path.
+// Interface names may contain dots (e.g. flannel.1), so we cannot blindly
+// replace all dots with slashes. For interface-specific keys of the form
+// "net.ipv4.conf.<iface>.<param>", only the <iface> segment must preserve
+// its dots.
+func procSysPath(key string) string {
+	const ifacePrefix = "net.ipv4.conf."
+	if strings.HasPrefix(key, ifacePrefix) {
+		rest := key[len(ifacePrefix):]
+		lastDot := strings.LastIndex(rest, ".")
+		if lastDot > 0 {
+			iface := rest[:lastDot]
+			param := rest[lastDot+1:]
+			return "/proc/sys/net/ipv4/conf/" + iface + "/" + param
+		}
+	}
+	return fmt.Sprintf("/proc/sys/%s", strings.ReplaceAll(key, ".", "/"))
+}
+
 // Set sets a sysctl configuration, if onlyIfOne is true it will only set the new value if it's set to 1
 func Set(key string, desiredValue int, onlyIfOne bool) (int, error) {
-	path := fmt.Sprintf("/proc/sys/%s", strings.ReplaceAll(key, ".", "/"))
+	path := procSysPath(key)
 	currentValue, err := os.ReadFile(path)
 	if err != nil {
 		return -1, fmt.Errorf("read sysctl %s: %w", key, err)
