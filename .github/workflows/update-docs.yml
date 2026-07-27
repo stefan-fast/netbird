@@ -1,11 +1,7 @@
 name: update docs
 
 on:
-  push:
-    tags:
-      - "v*"
-    paths:
-      - "shared/management/http/api/openapi.yml"
+  workflow_dispatch:
 
 jobs:
   trigger_docs_api_update:

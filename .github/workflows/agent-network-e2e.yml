@@ -1,17 +1,7 @@
 name: Agent Network E2E
 
 on:
-  # Nightly at 03:00 UTC, plus on demand from the Actions tab.
-  schedule:
-    - cron: "0 3 * * *"
   workflow_dispatch:
-    inputs:
-      bedrock_model:
-        description: >-
-          Bedrock inference-profile id to drive the matrix with, exactly as
-          AWS issues it. Leave empty for the Sonnet 4.6 default.
-        required: false
-        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

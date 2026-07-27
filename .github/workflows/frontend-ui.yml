@@ -1,19 +1,7 @@
 name: UI Frontend
 
 on:
-  pull_request:
-    paths:
-      - "client/ui/frontend/**"
-      - "client/ui/i18n/**"
-      - "client/ui/**/*.go"
-      - ".github/workflows/frontend-ui.yml"
-  push:
-    branches:
-      - main
-    paths:
-      - "client/ui/frontend/**"
-      - "client/ui/i18n/**"
-      - "client/ui/**/*.go"
+  workflow_dispatch:
 
 permissions:
   contents: read

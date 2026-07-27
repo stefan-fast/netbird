@@ -1,15 +1,7 @@
 name: Test Infrastructure files
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    paths:
-      - "infrastructure_files/**"
-      - ".github/workflows/test-infrastructure-files.yml"
-      - "management/cmd/**"
-      - "signal/cmd/**"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.actor_id }}
