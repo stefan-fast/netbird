@@ -1,12 +1,7 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
 
 env:
   SIGN_PIPE_VER: "v0.1.8"

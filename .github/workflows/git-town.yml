@@ -1,9 +1,7 @@
 name: Git Town
 
 on:
-  pull_request:
-    branches:
-      - "**"
+  workflow_dispatch:
 
 jobs:
   git-town:

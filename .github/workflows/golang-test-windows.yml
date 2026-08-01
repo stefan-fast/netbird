@@ -1,10 +1,7 @@
 name: "Windows"
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
 
 env:
   downloadPath: '${{ github.workspace }}\temp'
