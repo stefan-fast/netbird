@@ -116,8 +116,18 @@ func TestNftablesManager_AddNatRule(t *testing.T) {
 									switch expression := expression.(type) {
 									case *expr.Meta:
 										require.False(t, expression.SourceRegister && expression.Key == expr.MetaKeyMARK, "NAT rule should not write a packet mark")
-									case *expr.Ct:
-										hasConnectionMarkWrite = hasConnectionMarkWrite || expression.SourceRegister && expression.Key == expr.CtKeyMARK
+									case *expr.Bitwise:
+										// The ct mark OR-set pattern produces a Bitwise with Xor = flagValue.
+										// The google/nftables library does not restore SourceRegister on Ct
+										// expressions read back from the kernel (NFTA_CT_SREG is not decoded
+										// in unmarshal), so we detect the ct mark write via the Bitwise
+										// expression that is unique to the OR-into-ct-mark idiom.
+										if len(expression.Xor) == 4 {
+											xorVal := binaryutil.NativeEndian.Uint32(expression.Xor)
+											if xorVal != 0 {
+												hasConnectionMarkWrite = true
+											}
+										}
 									}
 								}
 								require.True(t, hasConnectionMarkWrite, "NAT rule should write the connection mark")
@@ -1088,4 +1098,205 @@ func TestConvertPrefixesToSet_IPv6(t *testing.T) {
 	// 2001:db8::1/128 end (2001:db8::2)
 	assert.Equal(t, netip.MustParseAddr("2001:db8::2").As16(), [16]byte(elements[3].Key))
 	assert.True(t, elements[3].IntervalEnd)
+}
+
+func TestNftablesRouter_RoutePrerouting_AcceptCreatesMarkRule(t *testing.T) {
+	manager, err := Create(ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err)
+	require.NoError(t, manager.Init(nil))
+	t.Cleanup(func() { require.NoError(t, manager.Close(nil)) })
+
+	rtr := manager.router
+
+	src := []netip.Prefix{netip.MustParsePrefix("100.87.0.0/16")}
+	dst := firewall.Network{Prefix: netip.MustParsePrefix("192.168.178.222/32")}
+	rule, err := rtr.AddRouteFiltering(nil, src, dst, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
+	require.NoError(t, err)
+
+	ruleKey := rule.ID() + manglePreSuffix
+
+	nftConn := &nftables.Conn{}
+	chain, ok := rtr.chains[chainNameRtManglePre]
+	require.True(t, ok, "netbird-rt-mangle-pre chain must exist")
+
+	rules, err := nftConn.GetRules(chain.Table, chain)
+	require.NoError(t, err)
+
+	var found *nftables.Rule
+	for _, r := range rules {
+		if string(r.UserData) == ruleKey {
+			found = r
+			break
+		}
+	}
+	require.NotNil(t, found, "prerouting mark rule must exist for accept-action route rule")
+
+	// Verify the rule ORs the flag into the ct mark before returning:
+	// [...matchExprs... → Ct{read} → Bitwise(mask=^flag, xor=flag) → Ct{write} → VerdictReturn]
+	n := len(found.Exprs)
+	require.GreaterOrEqual(t, n, 5, "rule must have at least iifname + OR-mark exprs + return verdict")
+
+	// n-1: VerdictReturn
+	_, ok = found.Exprs[n-1].(*expr.Verdict)
+	require.True(t, ok, "last expr must be VerdictReturn")
+
+	// n-3: Bitwise — Xor field holds the flag value being OR'd into the ct mark.
+	// The google/nftables library does not restore SourceRegister on Ct expressions
+	// read back from the kernel (NFTA_CT_SREG is not decoded in unmarshal), so we
+	// verify the OR pattern via the Bitwise expression which is correctly round-tripped.
+	bw, ok := found.Exprs[n-3].(*expr.Bitwise)
+	require.True(t, ok, "third-to-last expr must be Bitwise (OR mask for ct mark)")
+	flagVal := binaryutil.NativeEndian.Uint32(bw.Xor)
+	assert.Equal(t, uint32(nbnet.PreroutingFwmarkRedirected), flagVal, "Bitwise Xor must be PreroutingFwmarkRedirected")
+
+	// n-4: Ct read (SourceRegister=false)
+	ctRead, ok := found.Exprs[n-4].(*expr.Ct)
+	require.True(t, ok, "fourth-to-last expr must be Ct (connection mark read)")
+	assert.Equal(t, expr.CtKeyMARK, ctRead.Key)
+	assert.False(t, ctRead.SourceRegister)
+}
+
+func TestNftablesRouter_RoutePrerouting_DropCreatesReturnRule(t *testing.T) {
+	manager, err := Create(ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err)
+	require.NoError(t, manager.Init(nil))
+	t.Cleanup(func() { require.NoError(t, manager.Close(nil)) })
+
+	rtr := manager.router
+
+	src := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	dst := firewall.Network{Prefix: netip.MustParsePrefix("192.168.1.1/32")}
+	rule, err := rtr.AddRouteFiltering(nil, src, dst, firewall.ProtocolALL, nil, nil, firewall.ActionDrop)
+	require.NoError(t, err)
+
+	ruleKey := rule.ID() + manglePreSuffix
+
+	nftConn := &nftables.Conn{}
+	chain := rtr.chains[chainNameRtManglePre]
+	rules, err := nftConn.GetRules(chain.Table, chain)
+	require.NoError(t, err)
+
+	var found *nftables.Rule
+	for _, r := range rules {
+		if string(r.UserData) == ruleKey {
+			found = r
+			break
+		}
+	}
+	require.NotNil(t, found, "prerouting rule must exist for drop-action route rule")
+
+	// Last expression must be a return verdict, no mark set.
+	last := found.Exprs[len(found.Exprs)-1]
+	verdict, ok := last.(*expr.Verdict)
+	require.True(t, ok, "last expr must be Verdict")
+	assert.Equal(t, expr.VerdictReturn, verdict.Kind, "drop-derived prerouting rule must use return, not mark")
+
+	// Must not contain a Ct mark write.
+	for _, e := range found.Exprs {
+		if ct, ok := e.(*expr.Ct); ok && ct.SourceRegister {
+			assert.NotEqual(t, expr.CtKeyMARK, ct.Key, "drop rule must not set the connection mark")
+		}
+	}
+}
+
+func TestNftablesRouter_RoutePrerouting_DropBeforeAccept(t *testing.T) {
+	manager, err := Create(ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err)
+	require.NoError(t, manager.Init(nil))
+	t.Cleanup(func() { require.NoError(t, manager.Close(nil)) })
+
+	rtr := manager.router
+
+	// Add ACCEPT rule first, then DROP rule — DROP must end up before ACCEPT.
+	src := []netip.Prefix{netip.MustParsePrefix("100.87.0.0/16")}
+	dst := firewall.Network{Prefix: netip.MustParsePrefix("10.0.0.1/32")}
+	acceptRule, err := rtr.AddRouteFiltering(nil, src, dst, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
+	require.NoError(t, err)
+
+	src2 := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	dropRule, err := rtr.AddRouteFiltering(nil, src2, dst, firewall.ProtocolALL, nil, nil, firewall.ActionDrop)
+	require.NoError(t, err)
+
+	acceptKey := acceptRule.ID() + manglePreSuffix
+	dropKey := dropRule.ID() + manglePreSuffix
+
+	nftConn := &nftables.Conn{}
+	chain := rtr.chains[chainNameRtManglePre]
+	rules, err := nftConn.GetRules(chain.Table, chain)
+	require.NoError(t, err)
+
+	acceptIdx, dropIdx := -1, -1
+	for i, r := range rules {
+		switch string(r.UserData) {
+		case acceptKey:
+			acceptIdx = i
+		case dropKey:
+			dropIdx = i
+		}
+	}
+	require.NotEqual(t, -1, acceptIdx, "accept prerouting rule must exist")
+	require.NotEqual(t, -1, dropIdx, "drop prerouting rule must exist")
+	assert.Less(t, dropIdx, acceptIdx, "drop rule must come before accept rule in prerouting chain")
+}
+
+func TestNftablesRouter_RoutePrerouting_DeleteRemovesBothRules(t *testing.T) {
+	manager, err := Create(ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err)
+	require.NoError(t, manager.Init(nil))
+	t.Cleanup(func() { require.NoError(t, manager.Close(nil)) })
+
+	rtr := manager.router
+
+	src := []netip.Prefix{netip.MustParsePrefix("100.87.0.0/16")}
+	dst := firewall.Network{Prefix: netip.MustParsePrefix("192.168.178.222/32")}
+	rule, err := rtr.AddRouteFiltering(nil, src, dst, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
+	require.NoError(t, err)
+
+	err = rtr.DeleteRouteRule(rule)
+	require.NoError(t, err)
+
+	mangleKey := rule.ID() + manglePreSuffix
+
+	nftConn := &nftables.Conn{}
+
+	fwdChain := rtr.chains[chainNameRoutingFw]
+	fwdRules, err := nftConn.GetRules(fwdChain.Table, fwdChain)
+	require.NoError(t, err)
+	for _, r := range fwdRules {
+		assert.NotEqual(t, rule.ID(), string(r.UserData), "forward rule must be removed")
+	}
+
+	preChain := rtr.chains[chainNameRtManglePre]
+	preRules, err := nftConn.GetRules(preChain.Table, preChain)
+	require.NoError(t, err)
+	for _, r := range preRules {
+		assert.NotEqual(t, mangleKey, string(r.UserData), "prerouting rule must be removed")
+	}
+}
+
+func TestNftablesRouter_RoutePrerouting_DoesNotAlterForwardChain(t *testing.T) {
+	manager, err := Create(ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err)
+	require.NoError(t, manager.Init(nil))
+	t.Cleanup(func() { require.NoError(t, manager.Close(nil)) })
+
+	rtr := manager.router
+
+	nftConn := &nftables.Conn{}
+	chain := rtr.chains[chainNameRoutingFw]
+	rulesBefore, err := nftConn.GetRules(chain.Table, chain)
+	require.NoError(t, err)
+	countBefore := len(rulesBefore)
+
+	src := []netip.Prefix{netip.MustParsePrefix("100.87.0.0/16")}
+	dst := firewall.Network{Prefix: netip.MustParsePrefix("192.168.178.222/32")}
+	rule, err := rtr.AddRouteFiltering(nil, src, dst, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
+	require.NoError(t, err)
+
+	rulesAfter, err := nftConn.GetRules(chain.Table, chain)
+	require.NoError(t, err)
+	// Exactly one new rule (the forward rule) must have been added.
+	assert.Equal(t, countBefore+1, len(rulesAfter), "only the forward rule must be added to netbird-rt-fwd")
+
+	_ = rtr.DeleteRouteRule(rule)
 }

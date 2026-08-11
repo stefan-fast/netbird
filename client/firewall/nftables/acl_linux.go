@@ -383,17 +383,8 @@ func (m *AclManager) createPreroutingRule(expressions []expr.Any, userData []byt
 			Register: 1,
 			Data:     binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL),
 		},
-
-		&expr.Immediate{
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(nbnet.PreroutingFwmarkRedirected),
-		},
-		&expr.Ct{
-			Key:            expr.CtKeyMARK,
-			Register:       1,
-			SourceRegister: true,
-		},
 	)
+	preroutingExprs = append(preroutingExprs, ctMarkOrExprs(nbnet.PreroutingFwmarkRedirected)...)
 
 	nfRule := m.rConn.AddRule(&nftables.Rule{
 		Table:    m.workTable,
@@ -473,23 +464,12 @@ func (m *AclManager) allowRedirectedTraffic(chainFwFilter *nftables.Chain) error
 }
 
 func (m *AclManager) addFwmarkToForward(chainFwFilter *nftables.Chain) {
+	exprs := ctMarkHasExprs(nbnet.PreroutingFwmarkRedirected)
+	exprs = append(exprs, &expr.Verdict{Kind: expr.VerdictAccept})
 	m.rConn.InsertRule(&nftables.Rule{
 		Table: m.workTable,
 		Chain: chainFwFilter,
-		Exprs: []expr.Any{
-			&expr.Ct{
-				Key:      expr.CtKeyMARK,
-				Register: 1,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     binaryutil.NativeEndian.PutUint32(nbnet.PreroutingFwmarkRedirected),
-			},
-			&expr.Verdict{
-				Kind: expr.VerdictAccept,
-			},
-		},
+		Exprs: exprs,
 	})
 }
 
@@ -708,4 +688,52 @@ func ipToBytes(ip net.IP, af addrFamily) []byte {
 		return ip.To4()
 	}
 	return ip.To16()
+}
+
+// ctMarkOrExprs returns the nftables expressions to OR a flag bit into the connection mark:
+//
+//	ct mark set (ct mark & ^flag) ^ flag
+//
+// The bitwise algebra clears the flag bit unconditionally then XORs it in, which is an
+// idempotent set: the bit is always 1 after the operation and all other bits are preserved.
+// Using OR semantics means multiple prerouting mark rules on the same connection do not
+// overwrite each other's flags.
+func ctMarkOrExprs(flag uint32) []expr.Any {
+	return []expr.Any{
+		&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           binaryutil.NativeEndian.PutUint32(^flag),
+			Xor:            binaryutil.NativeEndian.PutUint32(flag),
+		},
+		&expr.Ct{Key: expr.CtKeyMARK, Register: 1, SourceRegister: true},
+	}
+}
+
+// ctMarkHasExprs returns the nftables expressions to test whether a flag bit is set in the
+// connection mark:
+//
+//	(ct mark & flag) == flag
+//
+// This is a masked equality check — it passes only when all bits of flag are set in the
+// ct mark, regardless of what other bits are present. Using a masked check means the rule
+// still matches even when other flags are OR-combined into the same ct mark.
+func ctMarkHasExprs(flag uint32) []expr.Any {
+	return []expr.Any{
+		&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            4,
+			Mask:           binaryutil.NativeEndian.PutUint32(flag),
+			Xor:            binaryutil.NativeEndian.PutUint32(0),
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     binaryutil.NativeEndian.PutUint32(flag),
+		},
+	}
 }

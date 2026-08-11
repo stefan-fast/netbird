@@ -47,13 +47,17 @@ const (
 	jumpNatPost    = "jump-nat-post"
 	jumpNatOutput  = "jump-nat-output"
 	jumpMSSClamp   = "jump-mss-clamp"
+	jumpRtPreRoute = "jump-rt-pre-route"
 	markManglePre  = "mark-mangle-pre"
 	markManglePost = "mark-mangle-post"
 	matchSet       = "--match-set"
 
-	dnatSuffix = "_dnat"
-	snatSuffix = "_snat"
-	fwdSuffix  = "_fwd"
+	dnatSuffix      = "_dnat"
+	snatSuffix      = "_snat"
+	fwdSuffix       = "_fwd"
+	manglePreSuffix = "_manglepre"
+
+	chainRTPreRoute = "NETBIRD-RT-PRE-ROUTE"
 
 	// ipv4TCPHeaderSize is the minimum IPv4 (20) + TCP (20) header size for MSS calculation.
 	ipv4TCPHeaderSize = 40
@@ -186,6 +190,21 @@ func (r *router) AddRouteFiltering(
 
 	r.rules[string(ruleKey)] = rule
 
+	preSpec, err := r.buildRtPreRouteSpec(params, sources)
+	if err != nil {
+		return nil, fmt.Errorf("build prerouting rule spec: %w", err)
+	}
+	preRuleKey := string(ruleKey) + manglePreSuffix
+	if action == firewall.ActionDrop {
+		err = r.iptablesClient.Insert(tableMangle, chainRTPreRoute, 1, preSpec...)
+	} else {
+		err = r.iptablesClient.Append(tableMangle, chainRTPreRoute, preSpec...)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("add prerouting route rule: %w", err)
+	}
+	r.rules[preRuleKey] = preSpec
+
 	r.updateState()
 
 	return ruleKey, nil
@@ -210,6 +229,15 @@ func (r *router) DeleteRouteRule(rule firewall.Rule) error {
 		}
 	} else {
 		log.Debugf("route rule %s not found", ruleKey)
+	}
+
+	// Remove the paired prerouting rule if present.
+	preRuleKey := ruleKey + manglePreSuffix
+	if preRule, exists := r.rules[preRuleKey]; exists {
+		if err := r.iptablesClient.Delete(tableMangle, chainRTPreRoute, preRule...); err != nil {
+			return fmt.Errorf("delete prerouting route rule: %w", err)
+		}
+		delete(r.rules, preRuleKey)
 	}
 
 	r.updateState()
@@ -324,6 +352,8 @@ func (r *router) addLegacyRouteRule(pair firewall.RouterPair) error {
 
 	r.rules[ruleKey] = rule
 
+	r.updateState()
+
 	return nil
 }
 
@@ -422,6 +452,7 @@ func (r *router) cleanUpDefaultForwardRules() error {
 		{chainRTRDR, tableNat},
 		{chainNATOutput, tableNat},
 		{chainRTMSSCLAMP, tableMangle},
+		{chainRTPreRoute, tableMangle},
 	} {
 		ok, err := r.iptablesClient.ChainExists(chainInfo.table, chainInfo.chain)
 		if err != nil {
@@ -447,6 +478,7 @@ func (r *router) createContainers() error {
 		{chainRTNAT, tableNat},
 		{chainRTRDR, tableNat},
 		{chainRTMSSCLAMP, tableMangle},
+		{chainRTPreRoute, tableMangle},
 	} {
 		// Fallback: clear chains that survived an unclean shutdown.
 		if ok, _ := r.iptablesClient.ChainExists(chainInfo.table, chainInfo.chain); ok {
@@ -488,7 +520,7 @@ func (r *router) setupDataPlaneMark() error {
 	preRule := []string{
 		"-i", r.wgIface.Name(),
 		"-m", "conntrack", "--ctstate", "NEW",
-		"-j", "CONNMARK", "--set-mark", fmt.Sprintf("%#x", nbnet.DataPlaneMarkIn),
+		"-j", "CONNMARK", "--set-mark", fwmarkMask(nbnet.DataPlaneMarkIn),
 	}
 
 	if err := r.iptablesClient.AppendUnique(tableMangle, chainPREROUTING, preRule...); err != nil {
@@ -500,7 +532,7 @@ func (r *router) setupDataPlaneMark() error {
 	postRule := []string{
 		"-o", r.wgIface.Name(),
 		"-m", "conntrack", "--ctstate", "NEW",
-		"-j", "CONNMARK", "--set-mark", fmt.Sprintf("%#x", nbnet.DataPlaneMarkOut),
+		"-j", "CONNMARK", "--set-mark", fwmarkMask(nbnet.DataPlaneMarkOut),
 	}
 
 	if err := r.iptablesClient.AppendUnique(tableMangle, chainPOSTROUTING, postRule...); err != nil {
@@ -536,7 +568,7 @@ func (r *router) cleanupDataPlaneMark() error {
 func (r *router) addPostroutingRules() error {
 	// First rule for outbound masquerade
 	rule1 := []string{
-		"-m", "connmark", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasquerade),
+		"-m", "connmark", "--mark", fwmarkMask(nbnet.PreroutingFwmarkMasquerade),
 		"!", "-o", "lo",
 		"-j", routingFinalNatJump,
 	}
@@ -547,7 +579,7 @@ func (r *router) addPostroutingRules() error {
 
 	// Second rule for return traffic masquerade
 	rule2 := []string{
-		"-m", "connmark", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasqueradeReturn),
+		"-m", "connmark", "--mark", fwmarkMask(nbnet.PreroutingFwmarkMasqueradeReturn),
 		"-o", r.wgIface.Name(),
 		"-j", routingFinalNatJump,
 	}
@@ -627,11 +659,19 @@ func (r *router) addJumpRules() error {
 	}
 	r.rules[jumpNatPre] = rdrRule
 
+	// Jump from mangle prerouting chain to route prerouting sub-chain.
+	// Appended so masquerade mark rules inserted at position 1 take precedence.
+	rtPreRouteRule := []string{"-j", chainRTPreRoute}
+	if err := r.iptablesClient.Append(tableMangle, chainRTPRE, rtPreRouteRule...); err != nil {
+		return fmt.Errorf("add route prerouting jump rule: %v", err)
+	}
+	r.rules[jumpRtPreRoute] = rtPreRouteRule
+
 	return nil
 }
 
 func (r *router) cleanJumpRules() error {
-	for _, ruleKey := range []string{jumpNatPost, jumpManglePre, jumpNatPre, jumpMSSClamp} {
+	for _, ruleKey := range []string{jumpNatPost, jumpManglePre, jumpNatPre, jumpMSSClamp, jumpRtPreRoute} {
 		if rule, exists := r.rules[ruleKey]; exists {
 			var table, chain string
 			switch ruleKey {
@@ -647,6 +687,9 @@ func (r *router) cleanJumpRules() error {
 			case jumpMSSClamp:
 				table = tableMangle
 				chain = chainFORWARD
+			case jumpRtPreRoute:
+				table = tableMangle
+				chain = chainRTPRE
 			default:
 				return fmt.Errorf("unknown jump rule: %s", ruleKey)
 			}
@@ -669,7 +712,7 @@ func (r *router) addNatRule(pair firewall.RouterPair) error {
 		}
 	}
 
-	markValue := nbnet.PreroutingFwmarkMasquerade
+	var markValue uint32 = nbnet.PreroutingFwmarkMasquerade
 	if pair.Inverse {
 		markValue = nbnet.PreroutingFwmarkMasqueradeReturn
 	}
@@ -695,7 +738,7 @@ func (r *router) addNatRule(pair firewall.RouterPair) error {
 	rule = append(rule, sourceExp...)
 	rule = append(rule, destExp...)
 	rule = append(rule,
-		"-j", "CONNMARK", "--set-mark", fmt.Sprintf("%#x", markValue),
+		"-j", "CONNMARK", "--set-mark", fwmarkMask(markValue),
 	)
 
 	// Ensure nat rules come first, so the mark can be overwritten.
@@ -1150,4 +1193,42 @@ func (r *router) addPrefixToIPSet(name string, prefix netip.Prefix) error {
 
 func (r *router) destroyIPSet(name string) error {
 	return ipset.Destroy(name)
+}
+
+// buildRtPreRouteSpec builds the iptables rule args for the mangle prerouting paired
+// rule. For accept-action rules the connection mark is set to PreroutingFwmarkRedirected;
+// for drop-action rules the chain returns without marking. The iifname match ensures
+// only traffic arriving on the WireGuard interface is affected.
+func (r *router) buildRtPreRouteSpec(params routeFilteringRuleParams, sources []netip.Prefix) ([]string, error) {
+	base, err := r.genRouteRuleSpec(params, sources)
+	if err != nil {
+		return nil, err
+	}
+
+	// genRouteRuleSpec always appends ["-j", "<action>"] as the last two elements.
+	if len(base) < 2 {
+		return nil, fmt.Errorf("unexpected short rule spec: %v", base)
+	}
+	base = base[:len(base)-2]
+
+	spec := append([]string{"-i", r.wgIface.Name()}, base...)
+
+	if params.Action == firewall.ActionAccept {
+		spec = append(spec,
+			"-j", "CONNMARK",
+			"--set-mark", fwmarkMask(nbnet.PreroutingFwmarkRedirected),
+		)
+	} else {
+		spec = append(spec, "-j", "RETURN")
+	}
+
+	return spec, nil
+}
+
+// fwmarkMask formats a connmark value as "value/value" for use with iptables CONNMARK
+// --set-mark and -m connmark --mark. Using the same value as both value and mask is the
+// iptables idiom for OR-set (when setting) or masked bit-test (when matching): only the
+// bits defined by the mark constant are affected or tested, leaving all other bits intact.
+func fwmarkMask(mark uint32) string {
+	return fmt.Sprintf("%#x/%#x", mark, mark)
 }

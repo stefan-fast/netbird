@@ -3,7 +3,6 @@
 package iptables
 
 import (
-	"fmt"
 	"net/netip"
 	"os/exec"
 	"testing"
@@ -50,7 +49,8 @@ func TestIptablesManager_RestoreOrCreateContainers(t *testing.T) {
 	// 9. mangle postrouting mark rule
 	// 10. jump rule to MSS clamping chain
 	// 11. MSS clamping rule for outbound traffic
-	require.Len(t, manager.rules, 11, "should have created rules map")
+	// 12. jump rule to route prerouting sub-chain
+	require.Len(t, manager.rules, 12, "should have created rules map")
 
 	exists, err := manager.iptablesClient.Exists(tableNat, chainPOSTROUTING, "-j", chainRTNAT)
 	require.NoError(t, err, "should be able to query the iptables %s table and %s chain", tableNat, chainPOSTROUTING)
@@ -60,12 +60,12 @@ func TestIptablesManager_RestoreOrCreateContainers(t *testing.T) {
 	require.NoError(t, err, "should be able to query the iptables %s table and %s chain", tableMangle, chainPREROUTING)
 	require.True(t, exists, "prerouting jump rule should exist")
 	require.Equal(t, []string{
-		"-m", "connmark", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasquerade),
+		"-m", "connmark", "--mark", fwmarkMask(nbnet.PreroutingFwmarkMasquerade),
 		"!", "-o", "lo",
 		"-j", routingFinalNatJump,
 	}, manager.rules["static-nat-outbound"])
 	require.Equal(t, []string{
-		"-m", "connmark", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasqueradeReturn),
+		"-m", "connmark", "--mark", fwmarkMask(nbnet.PreroutingFwmarkMasqueradeReturn),
 		"-o", ifaceMock.Name(),
 		"-j", routingFinalNatJump,
 	}, manager.rules["static-nat-return"])
@@ -113,7 +113,7 @@ func TestIptablesManager_AddNatRule(t *testing.T) {
 				"-s", testCase.InputPair.Source.String(),
 				"-d", testCase.InputPair.Destination.String(),
 				"-j", "CONNMARK", "--set-mark",
-				fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasquerade),
+				fwmarkMask(nbnet.PreroutingFwmarkMasquerade),
 			}
 
 			exists, err := iptablesClient.Exists(tableMangle, chainRTPRE, markingRule...)
@@ -139,7 +139,7 @@ func TestIptablesManager_AddNatRule(t *testing.T) {
 				"-s", inversePair.Source.String(),
 				"-d", inversePair.Destination.String(),
 				"-j", "CONNMARK", "--set-mark",
-				fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasqueradeReturn),
+				fwmarkMask(nbnet.PreroutingFwmarkMasqueradeReturn),
 			}
 
 			exists, err = iptablesClient.Exists(tableMangle, chainRTPRE, inverseMarkingRule...)
@@ -188,7 +188,7 @@ func TestIptablesManager_RemoveNatRule(t *testing.T) {
 				"-s", testCase.InputPair.Source.String(),
 				"-d", testCase.InputPair.Destination.String(),
 				"-j", "CONNMARK", "--set-mark",
-				fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasquerade),
+				fwmarkMask(nbnet.PreroutingFwmarkMasquerade),
 			}
 
 			exists, err := iptablesClient.Exists(tableMangle, chainRTPRE, markingRule...)
@@ -208,7 +208,7 @@ func TestIptablesManager_RemoveNatRule(t *testing.T) {
 				"-s", inversePair.Source.String(),
 				"-d", inversePair.Destination.String(),
 				"-j", "CONNMARK", "--set-mark",
-				fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasqueradeReturn),
+				fwmarkMask(nbnet.PreroutingFwmarkMasqueradeReturn),
 			}
 
 			exists, err = iptablesClient.Exists(tableMangle, chainRTPRE, inverseMarkingRule...)
@@ -453,5 +453,98 @@ func TestFindSetNameInRule(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestIptablesRouter_RoutePrerouting_AcceptCreatesMarkRule(t *testing.T) {
+	if !isIptablesSupported() {
+		t.SkipNow()
+	}
+
+	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err)
+
+	manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err)
+	require.NoError(t, manager.init(nil))
+	defer func() { assert.NoError(t, manager.Reset()) }()
+
+	src := []netip.Prefix{netip.MustParsePrefix("100.87.0.0/16")}
+	dst := firewall.Network{Prefix: netip.MustParsePrefix("192.168.178.222/32")}
+	_, err = manager.AddRouteFiltering(nil, src, dst, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
+	require.NoError(t, err)
+
+	markRule := []string{
+		"-i", ifaceMock.Name(),
+		"-s", "100.87.0.0/16",
+		"-d", "192.168.178.222/32",
+		"-j", "CONNMARK", "--set-mark",
+		fwmarkMask(nbnet.PreroutingFwmarkRedirected),
+	}
+	exists, err := iptablesClient.Exists(tableMangle, chainRTPreRoute, markRule...)
+	require.NoError(t, err)
+	assert.True(t, exists, "mark rule must exist in NETBIRD-RT-PRE-ROUTE for accept-action route rule")
+}
+
+func TestIptablesRouter_RoutePrerouting_DropCreatesReturnRule(t *testing.T) {
+	if !isIptablesSupported() {
+		t.SkipNow()
+	}
+
+	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err)
+
+	manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err)
+	require.NoError(t, manager.init(nil))
+	defer func() { assert.NoError(t, manager.Reset()) }()
+
+	src := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	dst := firewall.Network{Prefix: netip.MustParsePrefix("192.168.1.1/32")}
+	_, err = manager.AddRouteFiltering(nil, src, dst, firewall.ProtocolALL, nil, nil, firewall.ActionDrop)
+	require.NoError(t, err)
+
+	returnRule := []string{
+		"-i", ifaceMock.Name(),
+		"-s", "10.0.0.0/8",
+		"-d", "192.168.1.1/32",
+		"-j", "RETURN",
+	}
+	exists, err := iptablesClient.Exists(tableMangle, chainRTPreRoute, returnRule...)
+	require.NoError(t, err)
+	assert.True(t, exists, "return rule must exist in NETBIRD-RT-PRE-ROUTE for drop-action route rule")
+}
+
+func TestIptablesRouter_RoutePrerouting_DeleteRemovesBothRules(t *testing.T) {
+	if !isIptablesSupported() {
+		t.SkipNow()
+	}
+
+	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err)
+
+	manager, err := newRouter(iptablesClient, ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err)
+	require.NoError(t, manager.init(nil))
+	defer func() { assert.NoError(t, manager.Reset()) }()
+
+	src := []netip.Prefix{netip.MustParsePrefix("100.87.0.0/16")}
+	dst := firewall.Network{Prefix: netip.MustParsePrefix("192.168.178.222/32")}
+	rule, err := manager.AddRouteFiltering(nil, src, dst, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
+	require.NoError(t, err)
+
+	err = manager.DeleteRouteRule(rule)
+	require.NoError(t, err)
+
+	fwdRules, err := iptablesClient.List(tableFilter, chainRTFWDIN)
+	require.NoError(t, err)
+	for _, r := range fwdRules {
+		assert.NotContains(t, r, "192.168.178.222", "forward rule must be removed")
+	}
+
+	preRules, err := iptablesClient.List(tableMangle, chainRTPreRoute)
+	require.NoError(t, err)
+	for _, r := range preRules {
+		assert.NotContains(t, r, "192.168.178.222", "prerouting rule must be removed")
 	}
 }

@@ -234,3 +234,56 @@ func TestInferDirectionForFirewallConnectionMarks(t *testing.T) {
 	assert.Equal(t, nftypes.Ingress, ct.inferDirection(nbnet.PreroutingFwmarkMasquerade, netip.Addr{}, netip.Addr{}))
 	assert.Equal(t, nftypes.Egress, ct.inferDirection(nbnet.PreroutingFwmarkMasqueradeReturn, netip.Addr{}, netip.Addr{}))
 }
+
+// The firewall writes connection marks with OR semantics, so a single connection can
+// carry the data plane mark together with a prerouting mark. Direction inference must
+// still classify those combinations correctly.
+func TestInferDirectionForCombinedConnectionMarks(t *testing.T) {
+	ct := &ConnTrack{}
+
+	tests := []struct {
+		name     string
+		mark     uint32
+		expected nftypes.Direction
+	}{
+		{
+			name:     "data plane in combined with redirected",
+			mark:     nbnet.DataPlaneMarkIn | nbnet.PreroutingFwmarkRedirected,
+			expected: nftypes.Ingress,
+		},
+		{
+			name:     "data plane in combined with masquerade",
+			mark:     nbnet.DataPlaneMarkIn | nbnet.PreroutingFwmarkMasquerade,
+			expected: nftypes.Ingress,
+		},
+		{
+			name:     "data plane in combined with redirected and masquerade",
+			mark:     nbnet.DataPlaneMarkIn | nbnet.PreroutingFwmarkRedirected | nbnet.PreroutingFwmarkMasquerade,
+			expected: nftypes.Ingress,
+		},
+		{
+			// DataPlaneMarkOut is a superset of DataPlaneMarkIn's bits, so egress has
+			// to be evaluated first for this to resolve correctly.
+			name:     "data plane out combined with masquerade return",
+			mark:     nbnet.DataPlaneMarkOut | nbnet.PreroutingFwmarkMasqueradeReturn,
+			expected: nftypes.Egress,
+		},
+		{
+			name:     "data plane out alone",
+			mark:     nbnet.DataPlaneMarkOut,
+			expected: nftypes.Egress,
+		},
+		{
+			name:     "data plane in alone",
+			mark:     nbnet.DataPlaneMarkIn,
+			expected: nftypes.Ingress,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, ct.inferDirection(tc.mark, netip.Addr{}, netip.Addr{}),
+				"mark %#x should infer %v", tc.mark, tc.expected)
+		})
+	}
+}

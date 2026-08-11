@@ -417,11 +417,18 @@ func (c *ConnTrack) getFlowID(conntrackID uint32) uuid.UUID {
 }
 
 func (c *ConnTrack) inferDirection(mark uint32, srcIP, dstIP netip.Addr) nftypes.Direction {
-	switch mark {
-	case nbnet.DataPlaneMarkIn, nbnet.PreroutingFwmarkRedirected, nbnet.PreroutingFwmarkMasquerade:
-		return nftypes.Ingress
-	case nbnet.DataPlaneMarkOut, nbnet.PreroutingFwmarkMasqueradeReturn:
+	// Firewall marks are OR-combined bit flags, so a connection can carry several at
+	// once (e.g. DataPlaneMarkIn together with PreroutingFwmarkRedirected). Test with
+	// masks rather than equality, and check the egress flags first: DataPlaneMarkOut
+	// is a superset of DataPlaneMarkIn's bits, so an equality-ordered check would
+	// misclassify outbound connections as inbound.
+	switch {
+	case hasMark(mark, nbnet.DataPlaneMarkOut), hasMark(mark, nbnet.PreroutingFwmarkMasqueradeReturn):
 		return nftypes.Egress
+	case hasMark(mark, nbnet.DataPlaneMarkIn),
+		hasMark(mark, nbnet.PreroutingFwmarkRedirected),
+		hasMark(mark, nbnet.PreroutingFwmarkMasquerade):
+		return nftypes.Ingress
 	}
 
 	// fallback if marks are not set
@@ -440,4 +447,11 @@ func (c *ConnTrack) inferDirection(mark uint32, srcIP, dstIP netip.Addr) nftypes
 	}
 
 	return nftypes.DirectionUnknown
+}
+
+// hasMark reports whether every bit of flag is set in mark. The firewall writes its
+// connection marks with OR semantics so that several flags can coexist on one
+// connection, which makes a masked test the only correct way to read them back.
+func hasMark(mark, flag uint32) bool {
+	return mark&flag == flag
 }

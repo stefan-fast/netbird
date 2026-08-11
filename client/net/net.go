@@ -27,14 +27,20 @@ const (
 	// DataPlaneMarkOut is the mark for outbound data plane traffic.
 	DataPlaneMarkOut = 0x1BD11
 
-	// PreroutingFwmarkRedirected is applied to packets that are were redirected (input -> forward, e.g. by Docker or Podman) for special handling.
+	// PreroutingFwmarkRedirected is applied to connections that were redirected (input -> forward,
+	// e.g. by Docker, Podman, or kube-proxy DNAT) for special handling. Bit 5 of the low byte
+	// within the 0x1BDxx data-plane band.
 	PreroutingFwmarkRedirected = 0x1BD20
 
-	// PreroutingFwmarkMasquerade is applied to packets that arrive from the NetBird interface and should be masqueraded.
-	PreroutingFwmarkMasquerade = 0x1BD21
+	// PreroutingFwmarkMasquerade is applied to connections that arrive from the NetBird interface
+	// and should be masqueraded. Independent bit (bit 6) so it can coexist with
+	// PreroutingFwmarkRedirected on the same connection without collision.
+	PreroutingFwmarkMasquerade = 0x1BD40
 
-	// PreroutingFwmarkMasqueradeReturn is applied to packets that will leave through the NetBird interface and should be masqueraded.
-	PreroutingFwmarkMasqueradeReturn = 0x1BD22
+	// PreroutingFwmarkMasqueradeReturn is applied to connections that will leave through the
+	// NetBird interface and should be masqueraded. Independent bit (bit 7) so it can coexist
+	// with the other prerouting marks without collision.
+	PreroutingFwmarkMasqueradeReturn = 0x1BD80
 )
 
 // IsDataPlaneMark determines if a fwmark is in the data plane range (0x1BD10-0x1BDFF)
