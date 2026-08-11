@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -40,6 +41,7 @@ const (
 	chainNameNATOutput     = "netbird-nat-output"
 	chainNameForward       = "FORWARD"
 	chainNameMangleForward = "netbird-mangle-forward"
+	chainNameRtManglePre   = "netbird-rt-mangle-pre"
 
 	firewalldTableName = "firewalld"
 
@@ -47,8 +49,9 @@ const (
 	userDataAcceptForwardRuleOif = "frwacceptoif"
 	userDataAcceptInputRule      = "inputaccept"
 
-	dnatSuffix = "_dnat"
-	snatSuffix = "_snat"
+	dnatSuffix      = "_dnat"
+	snatSuffix      = "_snat"
+	manglePreSuffix = "_manglepre"
 
 	// ipv4TCPHeaderSize is the minimum IPv4 (20) + TCP (20) header size for MSS calculation.
 	ipv4TCPHeaderSize = 40
@@ -275,6 +278,19 @@ func (r *router) createContainers() error {
 		Type:     nftables.ChainTypeFilter,
 	})
 
+	r.chains[chainNameRtManglePre] = r.conn.AddChain(&nftables.Chain{
+		Name:  chainNameRtManglePre,
+		Table: r.workTable,
+	})
+
+	r.conn.AddRule(&nftables.Rule{
+		Table: r.workTable,
+		Chain: r.chains[chainNameManglePrerouting],
+		Exprs: []expr.Any{
+			&expr.Verdict{Kind: expr.VerdictJump, Chain: chainNameRtManglePre},
+		},
+	})
+
 	insertReturnTrafficRule(r.conn, r.workTable, r.chains[chainNameRoutingFw])
 
 	r.addPostroutingRules()
@@ -438,6 +454,10 @@ func (r *router) AddRouteFiltering(
 		exprs = append(exprs, applyPort(dPort, false)...)
 	}
 
+	// Snapshot match-only expressions for the paired prerouting rule before adding
+	// the counter and verdict which are specific to the forward chain rule.
+	matchExprs := slices.Clone(exprs)
+
 	exprs = append(exprs, &expr.Counter{})
 
 	var verdict expr.VerdictKind
@@ -468,6 +488,25 @@ func (r *router) AddRouteFiltering(
 	}
 
 	r.rules[string(ruleKey)] = rule
+
+	// Paired prerouting rule: marks (accept) or returns without marking (drop) before DNAT.
+	preExprs := buildRtPreRouteExprs(r.wgIface.Name(), matchExprs, action)
+	preRuleKey := string(ruleKey) + manglePreSuffix
+	preRule := &nftables.Rule{
+		Table:    r.workTable,
+		Chain:    r.chains[chainNameRtManglePre],
+		Exprs:    preExprs,
+		UserData: []byte(preRuleKey),
+	}
+	if action == firewall.ActionDrop {
+		preRule = r.conn.InsertRule(preRule)
+	} else {
+		preRule = r.conn.AddRule(preRule)
+	}
+	if err := r.conn.Flush(); err != nil {
+		return nil, fmt.Errorf(flushError, err)
+	}
+	r.rules[preRuleKey] = preRule
 
 	log.Debugf("added route rule: sources=%v, destination=%v, proto=%v, sPort=%v, dPort=%v, action=%v", sources, destination, proto, sPort, dPort, action)
 
@@ -530,6 +569,23 @@ func (r *router) DeleteRouteRule(rule firewall.Rule) error {
 
 	if err := r.conn.Flush(); err != nil {
 		return fmt.Errorf(flushError, err)
+	}
+
+	// Remove the paired prerouting rule first, before decrementing the set counter,
+	// so the kernel rule no longer holds a reference to the set when we try to destroy it.
+	preRuleKey := ruleKey + manglePreSuffix
+	if preRule, exists := r.rules[preRuleKey]; exists {
+		if preRule.Handle == 0 {
+			log.Warnf("route prerouting rule %s has no handle, removing stale entry", preRuleKey)
+			delete(r.rules, preRuleKey)
+		} else {
+			if err := r.deleteNftRule(preRule, preRuleKey); err != nil {
+				return fmt.Errorf("delete prerouting rule: %w", err)
+			}
+			if err := r.conn.Flush(); err != nil {
+				return fmt.Errorf(flushError, err)
+			}
+		}
 	}
 
 	if err := r.decrementSetCounter(nftRule); err != nil {
@@ -768,17 +824,7 @@ func (r *router) addNatRule(pair firewall.RouterPair) error {
 		markValue = nbnet.PreroutingFwmarkMasqueradeReturn
 	}
 
-	exprs = append(exprs,
-		&expr.Immediate{
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(markValue),
-		},
-		&expr.Ct{
-			Key:            expr.CtKeyMARK,
-			SourceRegister: true,
-			Register:       1,
-		},
-	)
+	exprs = append(exprs, ctMarkOrExprs(markValue)...)
 
 	ruleKey := firewall.GenKey(firewall.PreroutingFormat, pair)
 
@@ -803,18 +849,8 @@ func (r *router) addNatRule(pair firewall.RouterPair) error {
 // addPostroutingRules adds the masquerade rules
 func (r *router) addPostroutingRules() {
 	// First masquerade rule for traffic coming in from WireGuard interface
-	exprs := []expr.Any{
-		// Match on the first fwmark
-		&expr.Ct{
-			Key:      expr.CtKeyMARK,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(nbnet.PreroutingFwmarkMasquerade),
-		},
-
+	exprs := ctMarkHasExprs(nbnet.PreroutingFwmarkMasquerade)
+	exprs = append(exprs,
 		// We need to exclude the loopback interface as this changes the ebpf proxy port
 		&expr.Meta{
 			Key:      expr.MetaKeyOIFNAME,
@@ -827,7 +863,7 @@ func (r *router) addPostroutingRules() {
 		},
 		&expr.Counter{},
 		&expr.Masq{},
-	}
+	)
 
 	r.conn.AddRule(&nftables.Rule{
 		Table: r.workTable,
@@ -836,18 +872,8 @@ func (r *router) addPostroutingRules() {
 	})
 
 	// Second masquerade rule for traffic going out through WireGuard interface
-	exprs2 := []expr.Any{
-		// Match on the second fwmark
-		&expr.Ct{
-			Key:      expr.CtKeyMARK,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(nbnet.PreroutingFwmarkMasqueradeReturn),
-		},
-
+	exprs2 := ctMarkHasExprs(nbnet.PreroutingFwmarkMasqueradeReturn)
+	exprs2 = append(exprs2,
 		// Match WireGuard interface
 		&expr.Meta{
 			Key:      expr.MetaKeyOIFNAME,
@@ -860,7 +886,7 @@ func (r *router) addPostroutingRules() {
 		},
 		&expr.Counter{},
 		&expr.Masq{},
-	}
+	)
 
 	r.conn.AddRule(&nftables.Rule{
 		Table: r.workTable,
@@ -2244,4 +2270,24 @@ func (r *router) getIpSetExprs(ref refcounter.Ref[*nftables.Set], isSource bool)
 			SetID:          ref.Out.ID,
 		},
 	}, nil
+}
+
+// buildRtPreRouteExprs constructs the mangle-prerouting expressions for a paired route
+// ACL rule. For accept-action rules the connection mark PreroutingFwmarkRedirected is set
+// then the chain returns; for drop-action rules the chain returns without setting the
+// mark, so the packet falls through to normal FORWARD evaluation including the DROP rule.
+// Unlike the peer prerouting path there is no fib daddr type == RTN_LOCAL guard: routed
+// destinations are by definition not local addresses.
+func buildRtPreRouteExprs(ifaceName string, matchExprs []expr.Any, action firewall.Action) []expr.Any {
+	pre := []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(ifaceName)},
+	}
+	pre = append(pre, matchExprs...)
+
+	if action == firewall.ActionAccept {
+		pre = append(pre, ctMarkOrExprs(nbnet.PreroutingFwmarkRedirected)...)
+	}
+	pre = append(pre, &expr.Verdict{Kind: expr.VerdictReturn})
+	return pre
 }

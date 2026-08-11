@@ -3,7 +3,6 @@
 package iptables
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,8 +23,8 @@ func TestSeedInitialEntriesUsesConnectionMarkForRedirectedTraffic(t *testing.T) 
 	m.seedInitialEntries()
 	m.seedInitialOptionalEntries()
 
-	mark := fmt.Sprintf("%#x", nbnet.PreroutingFwmarkRedirected)
-	routeMark := fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasquerade)
+	mark := fwmarkMask(nbnet.PreroutingFwmarkRedirected)
+	routeMark := fwmarkMask(nbnet.PreroutingFwmarkMasquerade)
 	assert.Contains(t, m.entries[mangleFwdKey], []string{
 		"-i", "wt0", "-m", "conntrack", "--ctstate", "DNAT",
 		"-m", "connmark", "!", "--mark", mark,
