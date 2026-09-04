@@ -3,7 +3,6 @@
 package iptables
 
 import (
-	"fmt"
 	"net/netip"
 	"os/exec"
 	"testing"
@@ -103,7 +102,7 @@ func TestIptablesManager_AddNatRule(t *testing.T) {
 				"-s", testCase.InputPair.Source.String(),
 				"-d", testCase.InputPair.Destination.String(),
 				"-j", "MARK", "--set-mark",
-				fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasquerade),
+				fwmarkMask(nbnet.PreroutingFwmarkMasquerade),
 			}
 
 			exists, err := iptablesClient.Exists(tableMangle, chainRTPre, markingRule...)
@@ -129,7 +128,7 @@ func TestIptablesManager_AddNatRule(t *testing.T) {
 				"-s", inversePair.Source.String(),
 				"-d", inversePair.Destination.String(),
 				"-j", "MARK", "--set-mark",
-				fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasqueradeReturn),
+				fwmarkMask(nbnet.PreroutingFwmarkMasqueradeReturn),
 			}
 
 			exists, err = iptablesClient.Exists(tableMangle, chainRTPre, inverseMarkingRule...)
@@ -178,7 +177,7 @@ func TestIptablesManager_RemoveNatRule(t *testing.T) {
 				"-s", testCase.InputPair.Source.String(),
 				"-d", testCase.InputPair.Destination.String(),
 				"-j", "MARK", "--set-mark",
-				fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasquerade),
+				fwmarkMask(nbnet.PreroutingFwmarkMasquerade),
 			}
 
 			exists, err := iptablesClient.Exists(tableMangle, chainRTPre, markingRule...)
@@ -198,7 +197,7 @@ func TestIptablesManager_RemoveNatRule(t *testing.T) {
 				"-s", inversePair.Source.String(),
 				"-d", inversePair.Destination.String(),
 				"-j", "MARK", "--set-mark",
-				fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasqueradeReturn),
+				fwmarkMask(nbnet.PreroutingFwmarkMasqueradeReturn),
 			}
 
 			exists, err = iptablesClient.Exists(tableMangle, chainRTPre, inverseMarkingRule...)
@@ -355,6 +354,80 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			require.NoError(t, r.DeleteFilterRule(ruleKey), "Failed to delete rule")
 		})
 	}
+}
+
+// TestRouteFilterAcceptAddsRedirectMark verifies that an accepted route ACL
+// rule gets a paired mangle PREROUTING rule marking the connection
+// PreroutingFwmarkRedirected, without the dst-type LOCAL guard the peer ACL
+// pairing uses (a routed destination is never local), so downstream DNAT of
+// routed traffic is not mistaken for an ACL bypass attempt by the mangle
+// FORWARD guard rule.
+func TestRouteFilterAcceptAddsRedirectMark(t *testing.T) {
+	if !isIptablesSupported() {
+		t.Skip("iptables not supported on this system")
+	}
+
+	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err, "Failed to create iptables client")
+
+	r, err := newFamily(iptablesClient, ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err, "Failed to create family manager")
+	require.NoError(t, r.init(nil))
+	defer func() { assert.NoError(t, r.Reset()) }()
+
+	sources := []netip.Prefix{netip.MustParsePrefix("100.87.0.0/16")}
+	destination := netip.MustParsePrefix("192.168.178.222/32")
+	rule, err := r.AddFilterRule(nil, sources, firewall.Network{Prefix: destination}, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
+	require.NoError(t, err, "AddFilterRule failed")
+
+	stored, ok := r.filters[rule.ID()]
+	require.True(t, ok, "rule not stored in filters")
+
+	markRule := []string{
+		"-s", sources[0].String(),
+		"-d", destination.String(),
+		"-i", ifaceMock.Name(),
+		"-j", "MARK", "--set-xmark", fwmarkMask(nbnet.PreroutingFwmarkRedirected),
+	}
+	require.Equal(t, markRule, stored.mangleSpecs, "mangle mark spec should not have a dst-type LOCAL guard")
+
+	exists, err := iptablesClient.Exists(tableMangle, chainRTPre, markRule...)
+	require.NoError(t, err, "should be able to query the iptables %s table and %s chain", tableMangle, chainRTPre)
+	assert.True(t, exists, "redirect mark rule must exist in %s for an accepted route rule", chainRTPre)
+
+	require.NoError(t, r.DeleteFilterRule(rule))
+
+	exists, err = iptablesClient.Exists(tableMangle, chainRTPre, markRule...)
+	require.NoError(t, err, "should be able to query the iptables %s table and %s chain", tableMangle, chainRTPre)
+	assert.False(t, exists, "redirect mark rule must be removed together with the route rule")
+}
+
+// TestRouteFilterDropSkipsRedirectMark verifies that a dropped route ACL rule
+// gets no paired mangle rule: the traffic is denied by the filter-table route
+// ACL regardless, and marking it Redirected would serve no purpose.
+func TestRouteFilterDropSkipsRedirectMark(t *testing.T) {
+	if !isIptablesSupported() {
+		t.Skip("iptables not supported on this system")
+	}
+
+	iptablesClient, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	require.NoError(t, err, "Failed to create iptables client")
+
+	r, err := newFamily(iptablesClient, ifaceMock, iface.DefaultMTU)
+	require.NoError(t, err, "Failed to create family manager")
+	require.NoError(t, r.init(nil))
+	defer func() { assert.NoError(t, r.Reset()) }()
+
+	sources := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	destination := netip.MustParsePrefix("192.168.1.1/32")
+	rule, err := r.AddFilterRule(nil, sources, firewall.Network{Prefix: destination}, firewall.ProtocolALL, nil, nil, firewall.ActionDrop)
+	require.NoError(t, err, "AddFilterRule failed")
+
+	stored, ok := r.filters[rule.ID()]
+	require.True(t, ok, "rule not stored in filters")
+	assert.Nil(t, stored.mangleSpecs, "drop route rule must not get a paired mangle rule")
+
+	require.NoError(t, r.DeleteFilterRule(rule))
 }
 
 func TestFindSetNameInRule(t *testing.T) {

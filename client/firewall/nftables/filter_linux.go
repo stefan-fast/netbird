@@ -23,8 +23,12 @@ import (
 // destination empty the rule goes to the peer ACL input chain plus a
 // paired prerouting mangle rule for the redirect mark. With
 // destination set (prefix or named set) it goes to the route ACL
-// forward chain. Multi-source rules collapse to one nftables rule
-// backed by the shared refcounted hash:net set.
+// forward chain; an accept rule also gets a paired prerouting mangle
+// rule for the redirect mark (without the peer path's local-destination
+// guard, since a routed destination is never local), so downstream DNAT
+// of routed traffic is not mistaken for an ACL bypass attempt. Multi-source
+// rules collapse to one nftables rule backed by the shared refcounted
+// hash:net set.
 func (r *family) AddFilterRule(
 	id []byte,
 	sources []netip.Prefix,
@@ -46,14 +50,28 @@ func (r *family) AddFilterRule(
 		return nil, fmt.Errorf("apply source: %w", err)
 	}
 
+	// destExprs is resolved once and reused for both the main and paired mangle
+	// rule below, mirroring srcExprs: a destination Set (e.g. a domain set) is a
+	// named, refcounted set, and re-resolving it a second time would increment
+	// its refcount twice for what DeleteFilterRule only ever decrements once.
+	var destExprs []expr.Any
+	if isRoute {
+		destExprs, err = r.applyNetwork(destination, nil, false)
+		if err != nil {
+			r.dropNetworkMatch(srcExprs)
+			return nil, fmt.Errorf("apply destination: %w", err)
+		}
+	}
+
 	var exprs []expr.Any
 	if isRoute {
-		exprs, err = r.buildRouteFilterExprs(srcExprs, destination, proto, sPort, dPort)
+		exprs, err = r.buildRouteFilterExprs(srcExprs, destExprs, proto, sPort, dPort)
 	} else {
 		exprs, err = r.buildPeerFilterExprs(srcExprs, proto, sPort, dPort)
 	}
 	if err != nil {
 		r.dropNetworkMatch(srcExprs)
+		r.dropNetworkMatch(destExprs)
 		return nil, err
 	}
 
@@ -74,18 +92,27 @@ func (r *family) AddFilterRule(
 	// Build the paired prerouting mangle rule before flushing so both
 	// rules commit in one transaction. An anonymous port set binds to
 	// exactly one rule, so the mangle rule needs its own expression list
-	// with fresh sets, not a clone of the main rule's. Guard on the
-	// prerouting chain first: building the expressions queues the port
-	// set, so skipping the build when there is no chain to bind it to
-	// keeps an unbound set out of the connection batch.
+	// with fresh ports, not a clone of the main rule's; srcExprs/destExprs
+	// are reused as-is since their sets are shared and already refcounted
+	// once. Guard on the prerouting chain first: building the expressions
+	// queues the port set, so skipping the build when there is no chain to
+	// bind it to keeps an unbound set out of the connection batch. Route
+	// pairing is skipped for drop rules: the traffic is denied by the route
+	// ACL regardless, and marking it Redirected would serve no purpose.
 	var mangleRule *nftables.Rule
-	if !isRoute && r.chainPrerouting != nil {
-		mangleExprs, err := r.buildPeerFilterExprs(srcExprs, proto, sPort, dPort)
+	if r.chainPrerouting != nil && (!isRoute || action == firewall.ActionAccept) {
+		var mangleExprs []expr.Any
+		var err error
+		if isRoute {
+			mangleExprs, err = r.buildRouteMatchExprs(srcExprs, destExprs, proto, sPort, dPort)
+		} else {
+			mangleExprs, err = r.buildPeerFilterExprs(srcExprs, proto, sPort, dPort)
+		}
 		if err != nil {
 			r.dropNetworkMatch(exprs)
 			return nil, fmt.Errorf("build mangle rule: %w", err)
 		}
-		mangleRule = r.queuePreroutingRule(mangleExprs, userData)
+		mangleRule = r.queuePreroutingRule(mangleExprs, userData, !isRoute)
 	}
 
 	nftRule := &nftables.Rule{
@@ -156,23 +183,35 @@ func (r *family) buildPeerFilterExprs(
 // buildRouteFilterExprs assembles the forward-chain (route ACL) match:
 // source, then destination, then optional proto/ports, then a counter.
 func (r *family) buildRouteFilterExprs(
-	srcExprs []expr.Any,
-	destination firewall.Network,
+	srcExprs, destExprs []expr.Any,
+	proto firewall.Protocol,
+	sPort, dPort *firewall.Port,
+) ([]expr.Any, error) {
+	exprs, err := r.buildRouteMatchExprs(srcExprs, destExprs, proto, sPort, dPort)
+	if err != nil {
+		return nil, err
+	}
+	exprs = append(exprs, &expr.Counter{})
+	return exprs, nil
+}
+
+// buildRouteMatchExprs assembles the route ACL match-only expressions: source,
+// then destination, then optional proto/ports. Shared by buildRouteFilterExprs,
+// which appends its own counter, and the paired prerouting mangle rule, which
+// needs the same match without a counter. srcExprs/destExprs are resolved once
+// by the caller and passed in rather than rebuilt here, since rebuilding a
+// destination Set match would increment its refcount again.
+func (r *family) buildRouteMatchExprs(
+	srcExprs, destExprs []expr.Any,
 	proto firewall.Protocol,
 	sPort, dPort *firewall.Port,
 ) ([]expr.Any, error) {
 	exprs := append([]expr.Any{}, srcExprs...)
-
-	destExprs, err := r.applyNetwork(destination, nil, false)
-	if err != nil {
-		return nil, fmt.Errorf("apply destination: %w", err)
-	}
 	exprs = append(exprs, destExprs...)
 
 	if proto != firewall.ProtocolALL {
 		protoNum, err := r.af.protoNum(proto)
 		if err != nil {
-			r.dropNetworkMatch(destExprs)
 			return nil, fmt.Errorf("convert protocol to number: %w", err)
 		}
 		exprs = append(exprs,
@@ -182,13 +221,11 @@ func (r *family) buildRouteFilterExprs(
 
 		portExprs, err := r.applyPorts(sPort, dPort)
 		if err != nil {
-			r.dropNetworkMatch(destExprs)
 			return nil, err
 		}
 		exprs = append(exprs, portExprs...)
 	}
 
-	exprs = append(exprs, &expr.Counter{})
 	return exprs, nil
 }
 

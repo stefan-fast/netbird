@@ -17,6 +17,7 @@ import (
 	fw "github.com/netbirdio/netbird/client/firewall/manager"
 	"github.com/netbirdio/netbird/client/iface"
 	"github.com/netbirdio/netbird/client/iface/wgaddr"
+	nbnet "github.com/netbirdio/netbird/client/net"
 	"github.com/netbirdio/netbird/shared/management/domain"
 )
 
@@ -438,14 +439,20 @@ func TestIptablesRouteFilterIPSetFallback(t *testing.T) {
 		joined := strings.Join(fs.specs, " ")
 		require.Contains(t, joined, "-s "+sources[i].String(), "fallback rule must match by source prefix")
 		require.NotContains(t, joined, matchSet, "fallback rule must not use ipset matching")
-		require.Nil(t, fs.mangleSpecs, "route rules have no mangle pairing")
+
+		require.NotNil(t, fs.mangleSpecs, "accepted route rule must get a paired mangle rule")
+		mangleJoined := strings.Join(fs.mangleSpecs, " ")
+		require.NotContains(t, mangleJoined, "addrtype", "route mangle rule must not have a dst-type LOCAL guard")
+		require.Contains(t, mangleJoined, fwmarkMask(nbnet.PreroutingFwmarkRedirected), "route mangle rule must OR-mark the redirect flag")
 
 		checkRuleSpecs(t, ipv4Client, rr.chain, true, fs.specs...)
+		checkTableRuleSpecs(t, ipv4Client, tableMangle, chainRTPre, true, fs.mangleSpecs...)
 	}
 
 	require.NoError(t, manager.DeleteFilterRule(rule), "failed to delete fallback rule")
 	for _, fs := range all {
 		checkRuleSpecs(t, ipv4Client, rr.chain, false, fs.specs...)
+		checkTableRuleSpecs(t, ipv4Client, tableMangle, chainRTPre, false, fs.mangleSpecs...)
 	}
 }
 

@@ -95,8 +95,8 @@ func TestDefaultMarksAreUnchanged(t *testing.T) {
 		"DataPlaneMarkIn":                  {DataPlaneMarkIn, 0x1BD10},
 		"DataPlaneMarkOut":                 {DataPlaneMarkOut, 0x1BD11},
 		"PreroutingFwmarkRedirected":       {PreroutingFwmarkRedirected, 0x1BD20},
-		"PreroutingFwmarkMasquerade":       {PreroutingFwmarkMasquerade, 0x1BD21},
-		"PreroutingFwmarkMasqueradeReturn": {PreroutingFwmarkMasqueradeReturn, 0x1BD22},
+		"PreroutingFwmarkMasquerade":       {PreroutingFwmarkMasquerade, 0x1BD40},
+		"PreroutingFwmarkMasqueradeReturn": {PreroutingFwmarkMasqueradeReturn, 0x1BD80},
 	}
 
 	if fwmarkBase != defaultFwmarkBase {

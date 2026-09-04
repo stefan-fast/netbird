@@ -417,11 +417,14 @@ func (c *ConnTrack) getFlowID(conntrackID uint32) uuid.UUID {
 }
 
 func (c *ConnTrack) inferDirection(mark uint32, srcIP, dstIP netip.Addr) nftypes.Direction {
-	switch mark {
-	case nbnet.DataPlaneMarkIn:
-		return nftypes.Ingress
-	case nbnet.DataPlaneMarkOut:
+	// DataPlaneMarkOut is a superset of DataPlaneMarkIn's bits (see client/net/fwmark.go),
+	// so egress has to be checked first: an equality-ordered check would misclassify an
+	// egress mark as ingress since it also carries the ingress bit.
+	switch {
+	case hasMark(mark, nbnet.DataPlaneMarkOut):
 		return nftypes.Egress
+	case hasMark(mark, nbnet.DataPlaneMarkIn):
+		return nftypes.Ingress
 	}
 
 	// fallback if marks are not set
@@ -440,4 +443,13 @@ func (c *ConnTrack) inferDirection(mark uint32, srcIP, dstIP netip.Addr) nftypes
 	}
 
 	return nftypes.DirectionUnknown
+}
+
+// hasMark reports whether every bit of flag is set in mark. DataPlaneMarkOut
+// is a superset of DataPlaneMarkIn's bits by construction (see
+// client/net/fwmark.go), so a masked test is the correct way to read them
+// back, even though today only one of the two ever ends up set on a given
+// connection.
+func hasMark(mark, flag uint32) bool {
+	return mark&flag == flag
 }

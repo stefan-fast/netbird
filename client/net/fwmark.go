@@ -25,14 +25,18 @@ const (
 	fwmarkOffsetMask uint32 = 0xFF
 )
 
-// Offsets of the individual marks within the range.
+// Offsets of the individual marks within the range. offsetRedirected,
+// offsetMasquerade and offsetMasqueradeReturn are independent bits (5, 6, 7)
+// rather than sequential values: the firewall backends OR them into a
+// connection's mark instead of overwriting it, so a connection can carry
+// several of these flags at once without one clobbering another.
 const (
 	offsetControlPlane     uint32 = 0x00
 	offsetDataPlaneIn      uint32 = 0x10
 	offsetDataPlaneOut     uint32 = 0x11
 	offsetRedirected       uint32 = 0x20
-	offsetMasquerade       uint32 = 0x21
-	offsetMasqueradeReturn uint32 = 0x22
+	offsetMasquerade       uint32 = 0x40
+	offsetMasqueradeReturn uint32 = 0x80
 	offsetDataPlaneLower   uint32 = 0x10
 	offsetDataPlaneUpper   uint32 = fwmarkOffsetMask
 )
@@ -57,13 +61,19 @@ var (
 	// DataPlaneMarkOut is the mark for outbound data plane traffic.
 	DataPlaneMarkOut = fwmarkBase | offsetDataPlaneOut
 
-	// PreroutingFwmarkRedirected is applied to packets that were redirected (input -> forward, e.g. by Docker or Podman) for special handling.
+	// PreroutingFwmarkRedirected is applied to connections that were redirected (input -> forward,
+	// e.g. by Docker, Podman, or kube-proxy DNAT) for special handling. Bit 5 of the low byte
+	// within the data-plane band.
 	PreroutingFwmarkRedirected = fwmarkBase | offsetRedirected
 
-	// PreroutingFwmarkMasquerade is applied to packets that arrive from the NetBird interface and should be masqueraded.
+	// PreroutingFwmarkMasquerade is applied to connections that arrive from the NetBird interface
+	// and should be masqueraded. Independent bit (bit 6) so it can coexist with
+	// PreroutingFwmarkRedirected on the same connection without collision.
 	PreroutingFwmarkMasquerade = fwmarkBase | offsetMasquerade
 
-	// PreroutingFwmarkMasqueradeReturn is applied to packets that will leave through the NetBird interface and should be masqueraded.
+	// PreroutingFwmarkMasqueradeReturn is applied to connections that will leave through the
+	// NetBird interface and should be masqueraded. Independent bit (bit 7) so it can coexist
+	// with the other prerouting marks without collision.
 	PreroutingFwmarkMasqueradeReturn = fwmarkBase | offsetMasqueradeReturn
 )
 

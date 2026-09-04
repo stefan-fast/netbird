@@ -3,6 +3,7 @@
 package conntrack
 
 import (
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 	nfct "github.com/ti-mo/conntrack"
 	"github.com/ti-mo/netfilter"
+
+	nftypes "github.com/netbirdio/netbird/client/internal/netflow/types"
+	nbnet "github.com/netbirdio/netbird/client/net"
 )
 
 type mockListener struct {
@@ -221,4 +225,44 @@ func TestStartIsIdempotent(t *testing.T) {
 	assert.Equal(t, int32(1), callCount.Load(), "dial should only be called once")
 
 	ct.Stop()
+}
+
+// TestInferDirectionForDataPlaneMarks documents inferDirection's masked read of the
+// data-plane marks. DataPlaneMarkOut is a superset of DataPlaneMarkIn's bits by
+// construction, so egress has to be evaluated first for this to resolve correctly.
+// A connection carrying both bits cannot currently occur (only one of the mangle
+// PREROUTING/POSTROUTING ctstate-NEW rules ever fires per connection), but the masked
+// read keeps that combination classified as egress rather than silently misreading it
+// as ingress if that ever changes.
+func TestInferDirectionForDataPlaneMarks(t *testing.T) {
+	ct := &ConnTrack{}
+
+	tests := []struct {
+		name     string
+		mark     uint32
+		expected nftypes.Direction
+	}{
+		{
+			name:     "data plane in alone",
+			mark:     nbnet.DataPlaneMarkIn,
+			expected: nftypes.Ingress,
+		},
+		{
+			name:     "data plane out alone",
+			mark:     nbnet.DataPlaneMarkOut,
+			expected: nftypes.Egress,
+		},
+		{
+			name:     "data plane out combined with in's bits",
+			mark:     nbnet.DataPlaneMarkOut | nbnet.DataPlaneMarkIn,
+			expected: nftypes.Egress,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, ct.inferDirection(tc.mark, netip.Addr{}, netip.Addr{}),
+				"mark %#x should infer %v", tc.mark, tc.expected)
+		})
+	}
 }

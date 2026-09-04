@@ -11,7 +11,8 @@ import (
 // Rule wraps an installed filter rule (peer or route). Source set
 // membership is encoded in the rule's expressions; DeleteFilterRule
 // recovers the set name via findSets so the refcounter can drop the
-// right reference. mangleRule is set only for peer rules.
+// right reference. mangleRule is set for peer rules and for accepted
+// route rules.
 type Rule struct {
 	nftRule    *nftables.Rule
 	mangleRule *nftables.Rule

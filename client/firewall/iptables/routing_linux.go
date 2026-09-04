@@ -125,7 +125,7 @@ func (r *family) RemoveAllLegacyRouteRules() error {
 func (r *family) addPostroutingRules() error {
 	// First rule for outbound masquerade
 	rule1 := []string{
-		"-m", "mark", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasquerade),
+		"-m", "mark", "--mark", fwmarkMask(nbnet.PreroutingFwmarkMasquerade),
 		"!", "-o", "lo",
 		"-j", "MASQUERADE",
 	}
@@ -136,7 +136,7 @@ func (r *family) addPostroutingRules() error {
 
 	// Second rule for return traffic masquerade
 	rule2 := []string{
-		"-m", "mark", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkMasqueradeReturn),
+		"-m", "mark", "--mark", fwmarkMask(nbnet.PreroutingFwmarkMasqueradeReturn),
 		"-o", r.wgIface.Name(),
 		"-j", "MASQUERADE",
 	}
@@ -238,7 +238,7 @@ func (r *family) addNatRule(pair firewall.RouterPair) (err error) {
 	rule = append(rule, sourceExp...)
 	rule = append(rule, destExp...)
 	rule = append(rule,
-		"-j", "MARK", "--set-mark", fmt.Sprintf("%#x", markValue),
+		"-j", "MARK", "--set-mark", fwmarkMask(markValue),
 	)
 
 	// Ensure nat rules come first, so the mark can be overwritten.

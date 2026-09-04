@@ -118,17 +118,7 @@ func (r *family) setupDataPlaneMark() error {
 		},
 	}
 	preExprs = append(preExprs, ctNew...)
-	preExprs = append(preExprs,
-		&expr.Immediate{
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(nbnet.DataPlaneMarkIn),
-		},
-		&expr.Ct{
-			Key:            expr.CtKeyMARK,
-			Register:       1,
-			SourceRegister: true,
-		},
-	)
+	preExprs = append(preExprs, ctMarkOrExprs(nbnet.DataPlaneMarkIn)...)
 
 	preNftRule := &nftables.Rule{
 		Table: r.workTable,
@@ -149,17 +139,7 @@ func (r *family) setupDataPlaneMark() error {
 		},
 	}
 	postExprs = append(postExprs, ctNew...)
-	postExprs = append(postExprs,
-		&expr.Immediate{
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(nbnet.DataPlaneMarkOut),
-		},
-		&expr.Ct{
-			Key:            expr.CtKeyMARK,
-			Register:       1,
-			SourceRegister: true,
-		},
-	)
+	postExprs = append(postExprs, ctMarkOrExprs(nbnet.DataPlaneMarkOut)...)
 
 	postNftRule := &nftables.Rule{
 		Table: r.workTable,
@@ -610,8 +590,12 @@ func (r *family) Flush() error {
 // redirected traffic and queues it on the connection without flushing,
 // so the caller can commit it in the same transaction as the rule it
 // pairs with. Returns nil when the prerouting chain is absent, in which
-// case nothing is queued.
-func (r *family) queuePreroutingRule(expressions []expr.Any, userData []byte) *nftables.Rule {
+// case nothing is queued. requireLocalDest gates the mark on the packet's
+// pre-DNAT destination being a local address (the peer ACL case, where a
+// docker/podman-style external DNAT is what turns INPUT traffic into
+// FORWARD traffic); route ACL pairing passes false since a routed
+// destination is never local.
+func (r *family) queuePreroutingRule(expressions []expr.Any, userData []byte, requireLocalDest bool) *nftables.Rule {
 	if r.chainPrerouting == nil {
 		log.Warn("prerouting chain is not created")
 		return nil
@@ -632,29 +616,22 @@ func (r *family) queuePreroutingRule(expressions []expr.Any, userData []byte) *n
 		},
 	}, preroutingExprs...)
 
-	// local destination and mark
-	preroutingExprs = append(preroutingExprs,
-		&expr.Fib{
-			Register:       1,
-			ResultADDRTYPE: true,
-			FlagDADDR:      true,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL),
-		},
+	if requireLocalDest {
+		preroutingExprs = append(preroutingExprs,
+			&expr.Fib{
+				Register:       1,
+				ResultADDRTYPE: true,
+				FlagDADDR:      true,
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL),
+			},
+		)
+	}
 
-		&expr.Immediate{
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(nbnet.PreroutingFwmarkRedirected),
-		},
-		&expr.Meta{
-			Key:            expr.MetaKeyMARK,
-			Register:       1,
-			SourceRegister: true,
-		},
-	)
+	preroutingExprs = append(preroutingExprs, metaMarkOrExprs(nbnet.PreroutingFwmarkRedirected)...)
 
 	return r.conn.AddRule(&nftables.Rule{
 		Table:    r.workTable,
@@ -719,23 +696,12 @@ func (r *family) allowRedirectedTraffic(chainFwFilter *nftables.Chain) error {
 }
 
 func (r *family) addFwmarkToForward(chainFwFilter *nftables.Chain) {
+	exprs := metaMarkHasExprs(nbnet.PreroutingFwmarkRedirected)
+	exprs = append(exprs, &expr.Verdict{Kind: expr.VerdictAccept})
 	r.conn.InsertRule(&nftables.Rule{
 		Table: r.workTable,
 		Chain: chainFwFilter,
-		Exprs: []expr.Any{
-			&expr.Meta{
-				Key:      expr.MetaKeyMARK,
-				Register: 1,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     binaryutil.NativeEndian.PutUint32(nbnet.PreroutingFwmarkRedirected),
-			},
-			&expr.Verdict{
-				Kind: expr.VerdictAccept,
-			},
-		},
+		Exprs: exprs,
 	})
 }
 

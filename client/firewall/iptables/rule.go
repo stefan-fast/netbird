@@ -18,8 +18,8 @@ type Rule struct {
 }
 
 // filterSpecs is one installed iptables rule: its filter-table spec and
-// the paired mangle redirect-mark spec (nil for route rules or when the
-// mangle rule could not be added).
+// the paired mangle redirect-mark spec (nil for route DROP rules or when
+// the mangle rule could not be added).
 type filterSpecs struct {
 	specs       []string
 	mangleSpecs []string

@@ -134,17 +134,7 @@ func (r *family) natRuleExprs(pair firewall.RouterPair) ([]expr.Any, error) {
 		markValue = nbnet.PreroutingFwmarkMasqueradeReturn
 	}
 
-	exprs = append(exprs,
-		&expr.Immediate{
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(markValue),
-		},
-		&expr.Meta{
-			Key:            expr.MetaKeyMARK,
-			SourceRegister: true,
-			Register:       1,
-		},
-	)
+	exprs = append(exprs, metaMarkOrExprs(markValue)...)
 
 	return exprs, nil
 }
@@ -180,18 +170,8 @@ func (r *family) queueNatRule(pair firewall.RouterPair, exprs []expr.Any) {
 
 func (r *family) addPostroutingRules() {
 	// First masquerade rule for traffic coming in from WireGuard interface
-	exprs := []expr.Any{
-		// Match on the first fwmark
-		&expr.Meta{
-			Key:      expr.MetaKeyMARK,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(nbnet.PreroutingFwmarkMasquerade),
-		},
-
+	exprs := metaMarkHasExprs(nbnet.PreroutingFwmarkMasquerade)
+	exprs = append(exprs,
 		// We need to exclude the loopback interface as this changes the ebpf proxy port
 		&expr.Meta{
 			Key:      expr.MetaKeyOIFNAME,
@@ -204,7 +184,7 @@ func (r *family) addPostroutingRules() {
 		},
 		&expr.Counter{},
 		&expr.Masq{},
-	}
+	)
 
 	r.conn.AddRule(&nftables.Rule{
 		Table: r.workTable,
@@ -213,18 +193,8 @@ func (r *family) addPostroutingRules() {
 	})
 
 	// Second masquerade rule for traffic going out through WireGuard interface
-	exprs2 := []expr.Any{
-		// Match on the second fwmark
-		&expr.Meta{
-			Key:      expr.MetaKeyMARK,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     binaryutil.NativeEndian.PutUint32(nbnet.PreroutingFwmarkMasqueradeReturn),
-		},
-
+	exprs2 := metaMarkHasExprs(nbnet.PreroutingFwmarkMasqueradeReturn)
+	exprs2 = append(exprs2,
 		// Match WireGuard interface
 		&expr.Meta{
 			Key:      expr.MetaKeyOIFNAME,
@@ -237,7 +207,7 @@ func (r *family) addPostroutingRules() {
 		},
 		&expr.Counter{},
 		&expr.Masq{},
-	}
+	)
 
 	r.conn.AddRule(&nftables.Rule{
 		Table: r.workTable,

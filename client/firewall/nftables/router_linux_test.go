@@ -19,6 +19,7 @@ import (
 	"github.com/netbirdio/netbird/client/firewall/test"
 	"github.com/netbirdio/netbird/client/iface"
 	"github.com/netbirdio/netbird/client/internal/acl/id"
+	nbnet "github.com/netbirdio/netbird/client/net"
 )
 
 const (
@@ -354,6 +355,91 @@ func TestRouter_AddRouteFiltering(t *testing.T) {
 			verifyRule(t, nftRule, tt.sources, tt.destination, tt.proto, tt.sPort, tt.dPort, tt.direction, tt.action, tt.expectSet)
 		})
 	}
+}
+
+// TestRouter_RouteFilterAccept_AddsRedirectMarkRule verifies that an accepted
+// route ACL rule gets a paired prerouting mangle rule OR-marking the packet
+// PreroutingFwmarkRedirected, without the local-destination guard the peer
+// ACL pairing uses (a routed destination is never local), so downstream DNAT
+// of routed traffic is not mistaken for an ACL bypass attempt.
+func TestRouter_RouteFilterAccept_AddsRedirectMarkRule(t *testing.T) {
+	if check() != NFTABLES {
+		t.Skip("nftables not supported on this system")
+	}
+
+	workTable, err := createWorkTable()
+	require.NoError(t, err, "Failed to create work table")
+	defer deleteWorkTable()
+
+	r := newFamily(workTable, ifaceMock, iface.DefaultMTU)
+	require.NoError(t, r.init(workTable))
+	defer func(r *family) {
+		require.NoError(t, r.Reset(), "Failed to reset rules")
+	}(r)
+
+	sources := []netip.Prefix{netip.MustParsePrefix("100.87.0.0/16")}
+	destination := netip.MustParsePrefix("192.168.178.222/32")
+	rule, err := r.AddFilterRule(nil, sources, firewall.Network{Prefix: destination}, firewall.ProtocolALL, nil, nil, firewall.ActionAccept)
+	require.NoError(t, err, "AddFilterRule failed")
+	t.Cleanup(func() {
+		require.NoError(t, r.DeleteFilterRule(rule))
+	})
+
+	stored, ok := r.filters[id.RuleID(rule.ID())]
+	require.True(t, ok, "rule not stored in filters")
+	require.NotNil(t, stored.mangleRule, "accepted route rule must get a paired mangle rule")
+
+	for _, e := range stored.mangleRule.Exprs {
+		if fib, ok := e.(*expr.Fib); ok {
+			t.Fatalf("route mangle rule must not have a local-destination guard, found %+v", fib)
+		}
+	}
+
+	// The rule ORs the flag into the packet mark:
+	// [...matchExprs...] -> Meta{read} -> Bitwise(mask=^flag, xor=flag) -> Meta{write}.
+	n := len(stored.mangleRule.Exprs)
+	require.GreaterOrEqual(t, n, 3, "rule must have at least the OR-mark exprs")
+
+	bw, ok := stored.mangleRule.Exprs[n-2].(*expr.Bitwise)
+	require.True(t, ok, "second-to-last expr must be Bitwise (OR mask for packet mark)")
+	flagVal := binaryutil.NativeEndian.Uint32(bw.Xor)
+	assert.Equal(t, uint32(nbnet.PreroutingFwmarkRedirected), flagVal, "Bitwise Xor must be PreroutingFwmarkRedirected")
+
+	metaWrite, ok := stored.mangleRule.Exprs[n-1].(*expr.Meta)
+	require.True(t, ok, "last expr must be Meta (packet mark write)")
+	assert.Equal(t, expr.MetaKeyMARK, metaWrite.Key)
+	assert.True(t, metaWrite.SourceRegister)
+}
+
+// TestRouter_RouteFilterDrop_SkipsRedirectMarkRule verifies that a dropped
+// route ACL rule gets no paired mangle rule: the traffic is denied by the
+// route ACL regardless, and marking it Redirected would serve no purpose.
+func TestRouter_RouteFilterDrop_SkipsRedirectMarkRule(t *testing.T) {
+	if check() != NFTABLES {
+		t.Skip("nftables not supported on this system")
+	}
+
+	workTable, err := createWorkTable()
+	require.NoError(t, err, "Failed to create work table")
+	defer deleteWorkTable()
+
+	r := newFamily(workTable, ifaceMock, iface.DefaultMTU)
+	require.NoError(t, r.init(workTable))
+	defer func(r *family) {
+		require.NoError(t, r.Reset(), "Failed to reset rules")
+	}(r)
+
+	sources := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	destination := netip.MustParsePrefix("192.168.1.1/32")
+	rule, err := r.AddFilterRule(nil, sources, firewall.Network{Prefix: destination}, firewall.ProtocolALL, nil, nil, firewall.ActionDrop)
+	require.NoError(t, err, "AddFilterRule failed")
+	t.Cleanup(func() {
+		require.NoError(t, r.DeleteFilterRule(rule))
+	})
+
+	stored, ok := r.filters[id.RuleID(rule.ID())]
+	require.True(t, ok, "rule not stored in filters")
+	assert.Nil(t, stored.mangleRule, "drop route rule must not get a paired mangle rule")
 }
 
 func TestNftablesCreateIpSet(t *testing.T) {

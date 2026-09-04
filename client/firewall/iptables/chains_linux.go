@@ -89,7 +89,7 @@ func (r *family) setupDataPlaneMark() error {
 	preRule := []string{
 		"-i", r.wgIface.Name(),
 		"-m", "conntrack", "--ctstate", "NEW",
-		"-j", "CONNMARK", "--set-mark", fmt.Sprintf("%#x", nbnet.DataPlaneMarkIn),
+		"-j", "CONNMARK", "--set-mark", fwmarkMask(nbnet.DataPlaneMarkIn),
 	}
 
 	if err := r.iptablesClient.AppendUnique(tableMangle, chainPrerouting, preRule...); err != nil {
@@ -101,7 +101,7 @@ func (r *family) setupDataPlaneMark() error {
 	postRule := []string{
 		"-o", r.wgIface.Name(),
 		"-m", "conntrack", "--ctstate", "NEW",
-		"-j", "CONNMARK", "--set-mark", fmt.Sprintf("%#x", nbnet.DataPlaneMarkOut),
+		"-j", "CONNMARK", "--set-mark", fwmarkMask(nbnet.DataPlaneMarkOut),
 	}
 
 	if err := r.iptablesClient.AppendUnique(tableMangle, chainPostrouting, postRule...); err != nil {
@@ -143,7 +143,7 @@ func (r *family) seedInitialEntries() {
 	r.appendToEntries(mangleForwardKey, []string{
 		"-i", r.wgIface.Name(),
 		"-m", "conntrack", "--ctstate", "DNAT",
-		"-m", "mark", "!", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkRedirected),
+		"-m", "mark", "!", "--mark", fwmarkMask(nbnet.PreroutingFwmarkRedirected),
 		"-j", "DROP",
 	})
 }
@@ -151,7 +151,7 @@ func (r *family) seedInitialEntries() {
 func (r *family) seedInitialOptionalEntries() {
 	r.optionalEntries[chainForward] = []entry{
 		{
-			spec:     []string{"-m", "mark", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkRedirected), "-j", "ACCEPT"},
+			spec:     []string{"-m", "mark", "--mark", fwmarkMask(nbnet.PreroutingFwmarkRedirected), "-j", "ACCEPT"},
 			position: 2,
 		},
 	}

@@ -21,7 +21,10 @@ import (
 // AddFilterRule installs a packet-filtering rule. With destination
 // empty, the rule goes to the peer ACL input chain plus a paired
 // mangle PREROUTING rule for the redirect mark. With destination set
-// (prefix or named set), it goes to the route ACL forward chain.
+// (prefix or named set), it goes to the route ACL forward chain; an
+// accept rule also gets a paired mangle PREROUTING rule for the redirect
+// mark, so downstream DNAT of routed traffic is not mistaken for an
+// ACL bypass attempt.
 // Multi-source rules collapse to one iptables rule via the shared
 // hash:net ipset.
 func (r *family) AddFilterRule(
@@ -238,9 +241,13 @@ func (r *family) decrementSetCounter(rule []string) error {
 // installFilterRule assembles and writes the iptables filter-chain
 // rules for one filter rule, one per source match fragment. With
 // destination empty the rules land in the peer ACL input chain and each
-// gets a paired mangle PREROUTING rule for the redirect mark. With
-// destination set the rules land in the route ACL forward chain and
-// there is no mangle pairing.
+// gets a paired mangle PREROUTING rule for the redirect mark, guarded by
+// a dst-type LOCAL match. With destination set the rules land in the route
+// ACL forward chain; an accept rule also gets a paired mangle PREROUTING
+// rule (without the LOCAL guard, since a routed destination is never
+// local) so that traffic a route ACL rule accepted, which a third party
+// (e.g. kube-proxy) later DNATs downstream, still carries the redirect
+// mark the mangle FORWARD guard rule looks for. Drop rules get no pairing.
 func (r *family) installFilterRule(
 	ruleID nbid.RuleID,
 	srcMatches [][]string,
@@ -280,7 +287,13 @@ func (r *family) installFilterRule(
 			mangleSpecs = append(mangleSpecs,
 				"-i", r.wgIface.Name(),
 				"-m", "addrtype", "--dst-type", "LOCAL",
-				"-j", "MARK", "--set-xmark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkRedirected),
+				"-j", "MARK", "--set-xmark", fwmarkMask(nbnet.PreroutingFwmarkRedirected),
+			)
+		} else if action == firewall.ActionAccept {
+			mangleSpecs = slices.Clone(specs)
+			mangleSpecs = append(mangleSpecs,
+				"-i", r.wgIface.Name(),
+				"-j", "MARK", "--set-xmark", fwmarkMask(nbnet.PreroutingFwmarkRedirected),
 			)
 		}
 
