@@ -172,7 +172,7 @@ func (r *family) addPostroutingRules() {
 	// First masquerade rule for traffic coming in from WireGuard interface
 	exprs := metaMarkHasExprs(nbnet.PreroutingFwmarkMasquerade)
 	exprs = append(exprs,
-		// We need to exclude the loopback interface as this changes the ebpf proxy port
+		// We need to exclude the loopback interface as this changes the wg proxy port
 		&expr.Meta{
 			Key:      expr.MetaKeyOIFNAME,
 			Register: 1,
